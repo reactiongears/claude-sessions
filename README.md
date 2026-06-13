@@ -47,31 +47,28 @@ searchable menu. No more "which `de82dc58` was the auth one?"
 
 ## Install
 
-### Option A — npm (recommended)
+Clone the repo and link it globally:
 
 ```bash
-npm install -g claude-session-picker
+git clone https://github.com/reactiongears/claude-sessions.git
+cd claude-sessions
+npm link
 ```
 
-This installs two commands: **`claude-sessions`** and the short alias **`cs`**.
+That installs two commands: **`cs`** and the longer alias **`claude-sessions`**.
+Run `cs` from any project folder and you're off.
 
 > Heads up: the short `cs` name can collide with other tools (Coursier,
-> dotnet-script). If you already use `cs` for something else, just use the
-> `claude-sessions` command instead.
+> dotnet-script). If you already use `cs` for something else, use the
+> `claude-sessions` command instead — or alias it to whatever you like.
 
-### Option B — run without installing
+**Requirements:** Node.js ≥ 18. No other dependencies.
 
-```bash
-npx claude-session-picker
-```
+**Updating:** `git pull` inside the cloned folder — the linked command picks up
+changes automatically, no reinstall needed.
 
-### Option C — straight from GitHub
-
-```bash
-npm install -g github:reactiongears/claude-sessions
-```
-
-Requires **Node.js ≥ 18**. No other dependencies.
+**Uninstalling:** `npm unlink -g claude-session-picker` (or just delete the
+clone and run `npm unlink` from it).
 
 ---
 
@@ -232,14 +229,10 @@ cache.
 
 ## Development
 
-```bash
-git clone https://github.com/reactiongears/claude-sessions.git
-cd claude-sessions
-npm link        # provides the global `cs` / `claude-sessions` commands
-cs --list       # sanity check
-```
+Follow the [Install](#install) steps, then edit away — `npm link` symlinks the
+clone, so changes take effect immediately. Sanity-check with `cs --list`.
 
-It's a single file — `index.js`, ~450 lines, no dependencies. PRs welcome.
+It's a single file — `index.js`, ~500 lines, no dependencies. PRs welcome.
 
 ---
 
