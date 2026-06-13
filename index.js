@@ -19,7 +19,11 @@ const { spawnSync } = require('child_process');
 
 const PROJECTS_DIR = path.join(os.homedir(), '.claude', 'projects');
 const CACHE_FILE = path.join(os.homedir(), '.cache', 'claude-sessions-cache.json');
+const CACHE_VERSION = 2; // bump when scanned meta shape changes (invalidates old cache)
 const LIVE_THRESHOLD_MS = 5 * 60 * 1000; // mtime within 5 min => probably running
+const PREVIEW_DEFAULT = 3; // sentences shown in the preview pane by default
+const PREVIEW_MAX = 40; // ceiling for → expansion
+const TAIL_MAX_CHARS = 6000; // how much trailing conversation text to retain per session
 
 // ---------------------------------------------------------------- args
 
@@ -38,7 +42,7 @@ Usage: cs [query] [options]
   cs --list       non-interactive: print the table and exit
   cs --empty      include sessions with zero user messages
 
-Keys: ↑/↓ move · enter resume · type to filter · → details · tab all/here · esc quit`);
+Keys: ↑/↓ move · enter resume · type to filter · →/← preview more/less · tab all/here · esc quit`);
   process.exit(0);
 }
 
@@ -78,13 +82,53 @@ function truncate(str, width) {
   return str.slice(0, Math.max(0, width - 1)) + '…';
 }
 
+// Greedy word-wrap; hard-breaks any single token longer than width.
+function wordWrap(str, width) {
+  const lines = [];
+  let line = '';
+  for (const word of str.split(' ')) {
+    if (word.length > width) {
+      if (line) { lines.push(line); line = ''; }
+      for (let i = 0; i < word.length; i += width) lines.push(word.slice(i, i + width));
+      continue;
+    }
+    if (!line) line = word;
+    else if (line.length + 1 + word.length <= width) line += ' ' + word;
+    else { lines.push(line); line = word; }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 function extractText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    const t = content.find((c) => c && c.type === 'text' && typeof c.text === 'string');
-    return t ? t.text : '';
+    return content
+      .filter((c) => c && c.type === 'text' && typeof c.text === 'string')
+      .map((c) => c.text)
+      .join('\n')
+      .trim();
   }
   return '';
+}
+
+// Split a blob of conversation text into display "sentences". Newlines act as
+// hard boundaries (so lists/code don't merge into run-ons), and within a line
+// we break on . ! ? terminators.
+function splitSentences(text) {
+  if (!text) return [];
+  const out = [];
+  for (const line of text.split('\n')) {
+    const norm = line.replace(/\s+/g, ' ').trim();
+    if (!norm) continue;
+    // Break only on a terminator followed by whitespace, so dots inside paths,
+    // versions and decimals (e.g. ~/.claude, 2.1.143, 0.5) don't split.
+    for (const p of norm.split(/(?<=[.!?])\s+/)) {
+      const s = p.trim();
+      if (s) out.push(s);
+    }
+  }
+  return out;
 }
 
 function isNoise(text) {
@@ -102,8 +146,9 @@ function isNoise(text) {
 let cache = {};
 try {
   cache = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+  if (cache.__v !== CACHE_VERSION) cache = { __v: CACHE_VERSION };
 } catch {
-  cache = {};
+  cache = { __v: CACHE_VERSION };
 }
 
 function saveCache() {
@@ -123,6 +168,7 @@ function scanSessionFile(filePath) {
       aiTitle: null,
       firstUserText: null,
       lastUserText: null,
+      tailText: '',
       cwd: null,
       gitBranch: null,
       version: null,
@@ -130,6 +176,14 @@ function scanSessionFile(filePath) {
       assistantCount: 0,
       firstTs: null,
       lastTs: null,
+    };
+
+    // Rolling buffer of the most recent meaningful message texts (both roles).
+    // We keep more than we need, then trim to TAIL_MAX_CHARS at the end.
+    const recent = [];
+    const pushRecent = (role, text) => {
+      recent.push(role === 'user' ? `You: ${text}` : text);
+      if (recent.length > 16) recent.shift();
     };
 
     const stream = fs.createReadStream(filePath, { encoding: 'utf8' });
@@ -157,6 +211,13 @@ function scanSessionFile(filePath) {
 
       if (line.includes('"type":"assistant"')) {
         meta.assistantCount++;
+        try {
+          const d = JSON.parse(line);
+          if (d.message && d.message.role === 'assistant') {
+            const text = extractText(d.message.content);
+            if (text) pushRecent('assistant', text);
+          }
+        } catch {}
         return;
       }
 
@@ -172,6 +233,7 @@ function scanSessionFile(filePath) {
           meta.userCount++;
           if (!meta.firstUserText) meta.firstUserText = text;
           meta.lastUserText = text;
+          pushRecent('user', text);
         } catch {}
       } else if (!meta.cwd && line.includes('"cwd":"')) {
         try {
@@ -183,7 +245,12 @@ function scanSessionFile(filePath) {
       }
     });
 
-    rl.on('close', () => resolve(meta));
+    rl.on('close', () => {
+      let tail = recent.join('\n');
+      if (tail.length > TAIL_MAX_CHARS) tail = tail.slice(tail.length - TAIL_MAX_CHARS);
+      meta.tailText = tail;
+      resolve(meta);
+    });
     stream.on('error', () => resolve(meta));
   });
 }
@@ -284,7 +351,7 @@ function tui(allSessions, scopeLabel, hereDir, startAll) {
     let selected = 0;
     let offset = 0;
     let showAll = startAll;
-    let detail = null; // session shown in detail view
+    let previewN = PREVIEW_DEFAULT; // sentences shown in the preview pane (sticky)
 
     const out = process.stdout;
     out.write(`${ESC}?1049h${ESC}?25l`); // alt screen, hide cursor
@@ -317,40 +384,48 @@ function tui(allSessions, scopeLabel, hereDir, startAll) {
       if (selected >= list.length) selected = Math.max(0, list.length - 1);
 
       const lines = [];
+      const scope = showAll ? 'all projects' : scopeLabel;
+      lines.push(`${c.bold}${c.cyan} Claude Sessions${c.reset}${c.dim} — ${scope} · ${list.length} session${list.length === 1 ? '' : 's'}${c.reset}`);
+      lines.push(filter ? ` ${c.yellow}filter:${c.reset} ${filter}${c.inverse} ${c.reset}` : `${c.dim} type to filter…${c.reset}`);
+      lines.push('');
 
-      if (detail) {
-        renderDetail(lines, detail, cols, rows);
-      } else {
-        const scope = showAll ? 'all projects' : scopeLabel;
-        lines.push(`${c.bold}${c.cyan} Claude Sessions${c.reset}${c.dim} — ${scope} · ${list.length} session${list.length === 1 ? '' : 's'}${c.reset}`);
-        lines.push(filter ? ` ${c.yellow}filter:${c.reset} ${filter}${c.inverse} ${c.reset}` : `${c.dim} type to filter…${c.reset}`);
-        lines.push('');
+      // Build the preview pane for the highlighted session first, so we know how
+      // much vertical space the list gets. The list keeps at least 2 items.
+      const headerLines = 3;
+      const footerLines = 1;
+      const budget = Math.max(2, rows - headerLines - footerLines);
+      const maxPreview = Math.max(0, budget - 4); // always leave room for ≥2 items
+      const previewLines = list[selected] ? buildPreviewLines(list[selected], previewN, cols, maxPreview) : [];
 
-        const rowsPerItem = 2;
-        const listHeight = Math.max(1, Math.floor((rows - 5) / rowsPerItem));
-        if (selected < offset) offset = selected;
-        if (selected >= offset + listHeight) offset = selected - listHeight + 1;
-        const slice = list.slice(offset, offset + listHeight);
+      const listHeight = Math.max(2, budget - previewLines.length);
+      const itemsVisible = Math.max(1, Math.floor(listHeight / 2));
+      if (selected < offset) offset = selected;
+      if (selected >= offset + itemsVisible) offset = selected - itemsVisible + 1;
+      const slice = list.slice(offset, offset + itemsVisible);
 
-        slice.forEach((s, i) => {
-          const idx = offset + i;
-          const sel = idx === selected;
-          const live = isLive(s) ? `${c.green}●${c.reset}` : `${c.dim}○${c.reset}`;
-          const pointer = sel ? `${c.cyan}❯${c.reset}` : ' ';
-          const title = truncate(titleOf(s), cols - 8);
-          const titleStr = sel ? `${c.bold}${title}${c.reset}` : title;
-          const proj = showAll ? ` ${c.magenta}${truncate(projectLabel(s.projectDir, s.cwd), 40)}${c.reset}` : '';
-          const meta = `${relTime(s.mtimeMs)} · ${s.userCount} msgs · ${fmtSize(s.size)} · ${s.id.slice(0, 8)}${s.gitBranch && s.gitBranch !== 'HEAD' ? ` · ${s.gitBranch}` : ''}`;
-          lines.push(` ${pointer} ${live} ${titleStr}`);
-          lines.push(`     ${c.dim}${truncate(meta, cols - 6)}${c.reset}${proj}`);
-        });
+      const listLines = [];
+      slice.forEach((s, i) => {
+        const idx = offset + i;
+        const sel = idx === selected;
+        const live = isLive(s) ? `${c.green}●${c.reset}` : `${c.dim}○${c.reset}`;
+        const pointer = sel ? `${c.cyan}❯${c.reset}` : ' ';
+        const title = truncate(titleOf(s), cols - 8);
+        const titleStr = sel ? `${c.bold}${title}${c.reset}` : title;
+        const proj = showAll ? ` ${c.magenta}${truncate(projectLabel(s.projectDir, s.cwd), 40)}${c.reset}` : '';
+        const meta = `${relTime(s.mtimeMs)} · ${s.userCount} msgs · ${fmtSize(s.size)} · ${s.id.slice(0, 8)}${s.gitBranch && s.gitBranch !== 'HEAD' ? ` · ${s.gitBranch}` : ''}`;
+        listLines.push(` ${pointer} ${live} ${titleStr}`);
+        listLines.push(`     ${c.dim}${truncate(meta, cols - 6)}${c.reset}${proj}`);
+      });
+      if (list.length === 0) listLines.push(`   ${c.dim}(no matching sessions)${c.reset}`);
 
-        if (list.length === 0) lines.push(`   ${c.dim}(no matching sessions)${c.reset}`);
+      // Pad list region to its reserved height, then append the preview pane.
+      while (listLines.length < listHeight) listLines.push('');
+      listLines.length = listHeight;
+      lines.push(...listLines, ...previewLines);
 
-        while (lines.length < rows - 1) lines.push('');
-        lines.length = rows - 1;
-        lines.push(`${c.dim} ↑↓ move · enter resume · → details · tab ${showAll ? 'this project' : 'all projects'} · esc quit${c.reset}`);
-      }
+      while (lines.length < rows - 1) lines.push('');
+      lines.length = rows - 1;
+      lines.push(`${c.dim} ↑↓ move · enter resume · →/← preview · tab ${showAll ? 'this project' : 'all projects'} · esc quit${c.reset}`);
 
       out.write(`${ESC}H${ESC}2J` + lines.map((l) => truncateAnsiSafe(l, cols)).join('\n'));
     }
@@ -361,37 +436,28 @@ function tui(allSessions, scopeLabel, hereDir, startAll) {
       return line.includes('\x1b') ? line : truncate(line, cols);
     }
 
-    function renderDetail(lines, s, cols, rows) {
-      lines.push(`${c.bold}${c.cyan} ${truncate(titleOf(s), cols - 2)}${c.reset}`);
-      lines.push('');
-      lines.push(` ${c.dim}session${c.reset}   ${s.id}`);
-      lines.push(` ${c.dim}folder${c.reset}    ${s.cwd || projectLabel(s.projectDir)}`);
-      lines.push(` ${c.dim}branch${c.reset}    ${s.gitBranch || '—'}`);
-      lines.push(` ${c.dim}activity${c.reset}  ${relTime(s.mtimeMs)} (last) · started ${s.firstTs ? new Date(s.firstTs).toLocaleString() : '—'}`);
-      lines.push(` ${c.dim}messages${c.reset}  ${s.userCount} user · ${s.assistantCount} assistant · ${fmtSize(s.size)}`);
-      lines.push(` ${c.dim}version${c.reset}   ${s.version || '—'}`);
-      lines.push('');
-      const budget = rows - lines.length - 4;
-      const wrap = (label, text, max) => {
-        if (!text) return;
-        lines.push(` ${c.yellow}${label}${c.reset}`);
-        const words = text.replace(/\s+/g, ' ').trim();
-        let i = 0;
-        let used = 0;
-        while (i < words.length && used < max) {
-          lines.push(`   ${words.slice(i, i + cols - 4)}`);
-          i += cols - 4;
-          used++;
+    // Preview pane: a separator label plus the last `n` sentences of the
+    // session's conversation tail, wrapped to width and capped to `maxHeight`.
+    function buildPreviewLines(s, n, cols, maxHeight) {
+      if (maxHeight < 2) return [];
+      const sentences = splitSentences(s.tailText || s.lastUserText || s.firstUserText || '');
+      const shown = sentences.slice(-n);
+      const label = ` ${c.dim}╶─ preview · last ${shown.length} of ${sentences.length} · ${c.reset}${c.cyan}→${c.reset}${c.dim} more · ${c.reset}${c.cyan}←${c.reset}${c.dim} less ─╴${c.reset}`;
+      const body = [];
+      if (shown.length === 0) {
+        body.push(`   ${c.dim}(no conversation text yet)${c.reset}`);
+      } else {
+        const wrapWidth = Math.max(10, cols - 4);
+        for (const sent of shown) {
+          for (const seg of wordWrap(sent, wrapWidth)) {
+            body.push(`   ${c.dim}${seg}${c.reset}`);
+          }
         }
-        lines.push('');
-      };
-      wrap('first message', s.firstUserText, Math.max(2, Math.floor(budget / 2)));
-      if (s.lastUserText && s.lastUserText !== s.firstUserText) {
-        wrap('last message', s.lastUserText, Math.max(2, Math.floor(budget / 2)));
       }
-      while (lines.length < rows - 1) lines.push('');
-      lines.length = rows - 1;
-      lines.push(`${c.dim} enter resume · ← back · esc quit${c.reset}`);
+      // Cap: keep the label and the most recent body lines that fit.
+      const room = maxHeight - 1;
+      const kept = body.length > room ? body.slice(body.length - room) : body;
+      return [label, ...kept];
     }
 
     function resumeSelected(s) {
@@ -406,12 +472,6 @@ function tui(allSessions, scopeLabel, hereDir, startAll) {
 
       if (key === '\x03') { cleanup(); resolve(null); return; } // ctrl-c
 
-      if (detail) {
-        if (key === '\r' || key === '\n') return resumeSelected(detail);
-        if (key === '\x1b[D' || key === '\x1b' || key === 'q') { detail = null; render(); }
-        return;
-      }
-
       switch (key) {
         case '\x1b': // bare esc
           if (filter) { filter = ''; selected = 0; }
@@ -423,8 +483,11 @@ function tui(allSessions, scopeLabel, hereDir, startAll) {
         case '\x1b[B': // down
           selected = Math.min(Math.max(0, list.length - 1), selected + 1);
           break;
-        case '\x1b[C': // right -> detail
-          if (list[selected]) detail = list[selected];
+        case '\x1b[C': // right -> more preview
+          previewN = Math.min(PREVIEW_MAX, previewN + 1);
+          break;
+        case '\x1b[D': // left -> less preview
+          previewN = Math.max(1, previewN - 1);
           break;
         case '\t':
           showAll = !showAll;

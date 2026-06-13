@@ -1,6 +1,6 @@
 {
   "name": "claude-session-picker",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Browse and resume Claude Code sessions — a visual TUI picker for when multiple sessions live in one project folder",
   "bin": {
     "claude-sessions": "./index.js",
